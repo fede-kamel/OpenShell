@@ -355,7 +355,7 @@ discovery endpoint or its TLS CA.
 | pkiInitJob.timeoutSeconds | int | `120` | Maximum time in seconds for the certgen hook to poll for cert-manager certificates. When using cert-manager with BackendTLSPolicy, the hook polls for this many seconds waiting for the certificate to be issued, then creates the backend CA ConfigMap. The Job deadline is set to (timeoutSeconds + 30) to allow time for ConfigMap creation and cleanup. Increase this if cert-manager takes longer than 120 seconds to issue certificates. |
 | podAnnotations | object | `{}` | Extra annotations to add to the gateway pod. |
 | podLabels | object | `{}` | Extra labels to add to the gateway pod. |
-| podLifecycle.terminationGracePeriodSeconds | int | `5` | Grace period, in seconds, before Kubernetes terminates the gateway pod. |
+| podLifecycle.terminationGracePeriodSeconds | int | 5, or 20 when server.ocsfLog.path is set | Grace period, in seconds, before Kubernetes terminates the gateway pod. Empty uses 20 when server.ocsfLog.path is set, leaving time to drain queued OCSF records after other shutdown work, and 5 otherwise. |
 | podSecurityContext.fsGroup | int | `1000` | fsGroup assigned to the gateway pod. |
 | probes.liveness.failureThreshold | int | `3` | Liveness probe failure threshold before the container is restarted. |
 | probes.liveness.initialDelaySeconds | int | `2` | Liveness probe initial delay, in seconds. |
@@ -426,6 +426,12 @@ discovery endpoint or its TLS CA.
 | server.hostGatewayIP | string | `""` | Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get hostAliases entries mapping host.docker.internal and host.openshell.internal to this IP, allowing them to reach services running on the Docker host. Auto-detected by the cluster entrypoint script. |
 | server.logLevel | string | `"info"` | Gateway log level. |
 | server.name | string | `""` | Operator-facing gateway name. Defaults to the chart fullname so all replicas in one installation share an identity. Set explicitly when one telemetry collector receives spans from multiple namespaces or clusters. |
+| server.ocsfLog.maxFiles | int | `7` | Rotated files retained when rotation is daily. |
+| server.ocsfLog.path | string | `""` | OCSF JSONL path. Must be under /var/openshell, the chart's only writable gateway data volume. This currently requires a StatefulSet. |
+| server.ocsfLog.queueCapacity | int | `10000` | Maximum records waiting for the file writer. |
+| server.ocsfLog.queueMaxBytes | int | `16777216` | Maximum encoded bytes waiting for the file writer. |
+| server.ocsfLog.rotation | string | `"daily"` | Rotate the active file daily in UTC, or never. |
+| server.ocsfLog.schemaVersion | string | `""` | Optional OCSF downgrade target. Empty emits native OCSF 1.8.0. Supported values: "1.1", "1.3". |
 | server.oidc.adminRole | string | `""` | Role name for admin access. Leave empty (with userRole also empty) for authentication-only mode. Both must be set or both empty. |
 | server.oidc.audience | string | `"openshell-cli"` | Expected audience claim for the API resource server. This should match the server's --oidc-audience, NOT the CLI client ID. |
 | server.oidc.caConfigMapName | string | `""` | Name of a ConfigMap containing a CA certificate bundle (key: ca.crt) for verifying the OIDC issuer's TLS certificate. Required when the issuer uses a non-public CA (e.g. OpenShift ingress, private PKI). |

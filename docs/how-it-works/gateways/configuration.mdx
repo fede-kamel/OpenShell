@@ -303,6 +303,8 @@ queue_max_bytes = 16777216
 
 Unknown fields are rejected. This is one file destination, not an exporter registry. The existing `ocsf_json_enabled` sandbox setting remains independent.
 
+For Helm installations, set `server.ocsfLog.path` to render this table and optionally set `server.ocsfLog.schemaVersion`. The path must be under `/var/openshell`, the chart's only writable gateway data volume, so Helm-managed OCSF JSONL output currently requires the StatefulSet workload. The chart leaves the path empty and collection disabled by default. When the path is set and `podLifecycle.terminationGracePeriodSeconds` is empty, the chart raises the pod's termination grace period from 5 to 20 seconds so the gateway can drain queued records during shutdown.
+
 Give each gateway replica its own writable file and an external shipper read access to the containing directory. New files use owner-only permissions on Unix; arrange shipper access deliberately. Rotation renames the active file to a date- and UUID-suffixed sibling. The shipper must follow rotated files and checkpoint its progress. Do not use multiple writers or external copy-truncate rotation on this path.
 
 The gateway queues OCSF independently of `RUST_LOG`, excludes ordinary diagnostics, and preserves native event IDs. It writes up to 100 records per batch with a 500 ms batching interval. One additional bounded batch can be in flight. File errors do not stop sandbox execution: failed writes are not replayed, and subsequent records are discarded during reopen backoff. A restarted writer removes an incomplete trailing line before appending.

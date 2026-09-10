@@ -212,8 +212,11 @@ agentSandbox:
 
 # Pod restart behavior and health probe tuning.
 podLifecycle:
-  # -- Grace period, in seconds, before Kubernetes terminates the gateway pod.
-  terminationGracePeriodSeconds: 5
+  # -- (int) Grace period, in seconds, before Kubernetes terminates the gateway pod.
+  # Empty uses 20 when server.ocsfLog.path is set, leaving time to drain
+  # queued OCSF records after other shutdown work, and 5 otherwise.
+  # @default -- 5, or 20 when server.ocsfLog.path is set
+  terminationGracePeriodSeconds:
 
 probes:
   startup:
@@ -268,6 +271,22 @@ server:
     endpoint: ""
     # -- Gateway OpenTelemetry service name. Empty uses openshell-gateway.
     serviceName: ""
+  # Gateway-native OCSF JSONL output. Leave path empty to disable.
+  ocsfLog:
+    # -- OCSF JSONL path. Must be under /var/openshell, the chart's only
+    # writable gateway data volume. This currently requires a StatefulSet.
+    path: ""
+    # -- Optional OCSF downgrade target. Empty emits native OCSF 1.8.0.
+    # Supported values: "1.1", "1.3".
+    schemaVersion: ""
+    # -- Rotate the active file daily in UTC, or never.
+    rotation: daily
+    # -- Rotated files retained when rotation is daily.
+    maxFiles: 7
+    # -- Maximum records waiting for the file writer.
+    queueCapacity: 10000
+    # -- Maximum encoded bytes waiting for the file writer.
+    queueMaxBytes: 16777216
   # -- Enable anonymous OpenShell telemetry from the gateway and the sandbox
   # supervisors it launches.
   telemetryEnabled: true

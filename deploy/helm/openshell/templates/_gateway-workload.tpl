@@ -21,7 +21,11 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
-  terminationGracePeriodSeconds: {{ .Values.podLifecycle.terminationGracePeriodSeconds }}
+  {{- $gracePeriod := .Values.podLifecycle.terminationGracePeriodSeconds }}
+  {{- if kindIs "invalid" $gracePeriod }}
+  {{- $gracePeriod = ternary 20 5 (not (empty (.Values.server.ocsfLog | default dict).path)) }}
+  {{- end }}
+  terminationGracePeriodSeconds: {{ $gracePeriod }}
   {{- with .Values.imagePullSecrets }}
   imagePullSecrets:
     {{- toYaml . | nindent 4 }}
