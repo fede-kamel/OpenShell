@@ -118,18 +118,20 @@ mod tests {
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
-    // Restart policy is stored in SandboxSpec, and the count and well-known
-    // timestamps are stored in SandboxStatus. Legacy payloads decode with
-    // Unspecified (treated as Never), zero count, and absent timestamps.
+    // Restart policy and service authorization extend the public and durable
+    // schemas additively. Legacy payloads retain safe defaults: Never for
+    // restart policy and Strip for service authorization.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "b1f9b34f035234e1032685eb4fc829950acad63a971b3abd37a2ccbbec783531";
+        "ef392f9d8bdd28f27d12f71fe4c8e31626def1969b9fe7c0bdd71e81f29008e3";
     const DURABLE_SCHEMA_SHA256: &str =
-        "517561b578c88d28ffd74d128faf668e65aef03c784dd794aeb5208e1dbf6de3";
+        "40e515c6ca3d2487b6affa05b45ffbed3eb6d6bde08e0e7dfb46fe9089dba254";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "d60c0a91163bcdd6c29e24c64e0f00555f914240465f94295d800e9063171bef";
+        "eaacfe75b54d3137361d295ffc94bb91a8f50cbf68604c707266e29f7894add1";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
+    // ServiceEndpoint encoded before authorization_mode field 7 existed.
+    const SERVICE_ENDPOINT_WITHOUT_AUTHORIZATION_MODE: &str = "0a260a0b656e64706f696e742d6964120c73616e64626f782d2d77656228073a0764656661756c74120a73616e64626f782d69641a0773616e64626f78220377656228903f3001";
     // Synthetic payloads generated with the public declarations at v0.0.116,
     // before their relocation into openshell.storage.v1. Values are deliberately
     // non-secret and the ordinary protobuf bytes contain no package names.
@@ -589,14 +591,38 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (304, 26),
-                (92, 20),
-                (80, 20),
+                (304, 27),
+                (92, 21),
+                (80, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
             ),
             "the public/durable schema inventory changed; review API and storage ownership, preserve prior-payload decoding, and update the reviewed fingerprints"
+        );
+    }
+
+    #[test]
+    fn service_endpoint_without_authorization_mode_decodes_as_strip() {
+        use openshell_core::proto::{ServiceAuthorizationMode, ServiceEndpoint};
+
+        let endpoint = ServiceEndpoint::decode(
+            legacy_bytes(SERVICE_ENDPOINT_WITHOUT_AUTHORIZATION_MODE).as_slice(),
+        )
+        .expect("stored service endpoint without authorization mode must decode");
+
+        assert_eq!(endpoint.sandbox_id, "sandbox-id");
+        assert_eq!(endpoint.sandbox, "sandbox");
+        assert_eq!(endpoint.name, "web");
+        assert_eq!(endpoint.target_port, 8080);
+        assert!(endpoint.domain);
+        assert_eq!(
+            endpoint.authorization_mode(),
+            ServiceAuthorizationMode::Unspecified
+        );
+        assert_eq!(
+            crate::service_routing::effective_authorization_mode(endpoint.authorization_mode),
+            ServiceAuthorizationMode::Strip
         );
     }
 
