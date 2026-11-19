@@ -239,45 +239,40 @@ where
         return Ok(outcome);
     }
 
-    // No explicit framing (no Content-Length, no Transfer-Encoding).
-    // Per RFC 7230 §3.3.3 the body is delimited by connection close.
+    // No explicit framing (no Content-Length, no Transfer-Encoding). Per
+    // RFC 9112 §6.3 rule 8 the body is delimited by connection close whether
+    // or not the server announced `Connection: close`, so it is relayed
+    // until upstream EOF and the consumed connection is not reused. The
+    // client is told the connection will close; an event stream keeps its
+    // head as sent. A server that holds the connection open without framing
+    // ends the body at the relay's idle timeout.
     if matches!(body_length, BodyLength::None) {
-        if server_wants_close || http_10_closes_by_default || event_stream {
-            // Server indicated it will close, or this is a streaming response
-            // such as SSE where the body is intentionally delimited by EOF.
-            let before_end = &final_head[..final_head.len() - 2];
-            client.write_all(before_end).await.into_diagnostic()?;
-            if server_wants_close || http_10_closes_by_default {
-                client
-                    .write_all(b"Connection: close\r\n\r\n")
-                    .await
-                    .into_diagnostic()?;
-            } else {
-                client.write_all(b"\r\n").await.into_diagnostic()?;
-            }
-            let overflow = &buf[header_end..];
-            if !overflow.is_empty() {
-                client.write_all(overflow).await.into_diagnostic()?;
-                client.flush().await.into_diagnostic()?;
-            }
-            if event_stream {
-                relay_until_eof_without_idle_timeout(upstream, client).await?;
-            } else {
-                relay_until_eof(upstream, client).await?;
-            }
-            client.flush().await.into_diagnostic()?;
-            client.shutdown().await.into_diagnostic()?;
-            record_allowed_response(options.correlation);
-            return Ok(RelayOutcome::Consumed);
+        let before_end = &final_head[..final_head.len() - 2];
+        client.write_all(before_end).await.into_diagnostic()?;
+        if server_wants_close || http_10_closes_by_default || !event_stream {
+            client
+                .write_all(b"Connection: close\r\n\r\n")
+                .await
+                .into_diagnostic()?;
+        } else {
+            client.write_all(b"\r\n").await.into_diagnostic()?;
         }
-        // No Connection: close — an HTTP/1.1 keep-alive server that omits
-        // framing headers has an empty body.  Forward headers and continue
-        // the relay loop instead of blocking on relay_until_eof.
-        debug!("BodyLength::None without Connection: close — treating body as empty");
-        client.write_all(&final_head).await.into_diagnostic()?;
+        // Flush the head and any buffered body bytes before waiting for
+        // bytes that arrive later.
+        let overflow = &buf[header_end..];
+        if !overflow.is_empty() {
+            client.write_all(overflow).await.into_diagnostic()?;
+        }
         client.flush().await.into_diagnostic()?;
+        if event_stream {
+            relay_until_eof_without_idle_timeout(upstream, client).await?;
+        } else {
+            relay_until_eof(upstream, client).await?;
+        }
+        client.flush().await.into_diagnostic()?;
+        client.shutdown().await.into_diagnostic()?;
         record_allowed_response(options.correlation);
-        return Ok(RelayOutcome::Reusable);
+        return Ok(RelayOutcome::Consumed);
     }
 
     // Hold buffered chunk framing until relay_chunked validates it.
@@ -955,7 +950,6 @@ where
         &mut session,
         client,
         body_length,
-        server_wants_close,
         event_stream,
         &mut committed,
         chunked_output,
@@ -1214,9 +1208,11 @@ where
     client.flush().await.into_diagnostic()?;
     record_allowed_response(response_correlation);
     Ok(ResponseMiddlewareResult::Relayed(Some(
+        // An unframed upstream body was read to EOF (close-delimited or event
+        // stream), so that connection cannot serve another request.
         if server_wants_close
             || (committed && close_delimited_output)
-            || (matches!(body_length, BodyLength::None) && event_stream)
+            || matches!(body_length, BodyLength::None)
         {
             RelayOutcome::Consumed
         } else {
@@ -1245,12 +1241,17 @@ where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
 {
+    // An unframed body is close-delimited (RFC 9112 §6.3 rule 8): tell the
+    // client the connection will close. An event stream keeps its head.
+    let close_delimited_body = matches!(body_length, BodyLength::None)
+        && !event_stream
+        && !is_bodiless_response(request_method, status_code);
     let head = serialize_response_head(
         status_line,
         headers,
         preserved_credential_headers,
         ResponseFraming::Preserve(body_length),
-        server_wants_close,
+        server_wants_close || close_delimited_body,
         declared_trailers,
     );
     let head = final_response_head(&head, response_correlation);
@@ -1285,10 +1286,13 @@ where
             )
             .await?;
         }
-        BodyLength::None if server_wants_close || event_stream => {
+        BodyLength::None => {
+            // Close-delimited body or event stream: the body ends at upstream
+            // EOF, so the connection is consumed either way.
             if !overflow.is_empty() {
                 client.write_all(overflow).await.into_diagnostic()?;
             }
+            client.flush().await.into_diagnostic()?;
             if event_stream {
                 relay_until_eof_without_idle_timeout(upstream, client).await?;
             } else {
@@ -1296,11 +1300,6 @@ where
             }
             client.flush().await.into_diagnostic()?;
             return Ok(RelayOutcome::Consumed);
-        }
-        BodyLength::None => {
-            if !overflow.is_empty() {
-                client.write_all(overflow).await.into_diagnostic()?;
-            }
         }
     }
     client.flush().await.into_diagnostic()?;
@@ -1890,7 +1889,6 @@ async fn relay_normalized_response_body<R, C>(
     session: &mut openshell_supervisor_middleware::HttpResponseSession,
     client: &mut C,
     body_length: BodyLength,
-    server_wants_close: bool,
     event_stream: bool,
     committed: &mut bool,
     chunked_output: bool,
@@ -2047,7 +2045,10 @@ where
                 };
             }
         }
-        BodyLength::None if server_wants_close || event_stream => loop {
+        // Close-delimited (RFC 9112 §6.3 rule 8) or an event stream: read
+        // until upstream EOF; without an event stream the idle timeout ends
+        // a body from a server that holds the connection open unframed.
+        BodyLength::None => loop {
             // Cancel only input acquisition, never expiry or client writes.
             let wait = if pending.is_empty() {
                 if event_stream {
@@ -2105,10 +2106,6 @@ where
             )
             .await?;
         },
-        BodyLength::None => {
-            flush_normalized_response_bytes(session, client, pending, &mut framing).await?;
-            Ok(Vec::new())
-        }
     }
 }
 

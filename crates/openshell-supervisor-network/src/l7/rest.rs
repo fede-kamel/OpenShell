@@ -9019,14 +9019,19 @@ mod tests {
         .await;
         assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
 
+        // No framing and no Connection: close is close-delimited (RFC 9112
+        // §6.3 rule 8): the body is read to upstream EOF, the client is told
+        // the connection closes, and the upstream connection is consumed.
         let (outcome, delivered) = run_response_middleware_relay(
             b"HTTP/1.1 200 OK\r\n\r\n",
             "GET",
             ResponseRelayScript::HeadersOnly,
         )
         .await;
-        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
-        assert!(String::from_utf8(delivered).unwrap().ends_with("\r\n\r\n"));
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(delivered.contains("Connection: close\r\n"), "{delivered}");
+        assert!(delivered.ends_with("\r\n\r\n"), "{delivered}");
     }
 
     #[tokio::test]
@@ -9549,22 +9554,57 @@ mod tests {
         );
     }
 
+    /// RFC 9112 §6.3 rule 8: an HTTP/1.1 response with neither Content-Length
+    /// nor Transfer-Encoding is close-delimited even without `Connection:
+    /// close`. The body, including binary bytes buffered with the head and
+    /// bytes that arrive later, is forwarded until upstream EOF; the head is
+    /// flushed before waiting; the client is told the connection closes; and
+    /// the consumed upstream connection is not reused.
     #[tokio::test]
-    async fn relay_response_no_framing_without_connection_close_treats_as_empty() {
-        // Response without Content-Length, TE, or Connection: close.
-        // HTTP/1.1 keep-alive implies empty body — must not block.
-        let response = b"HTTP/1.1 200 OK\r\nServer: test\r\n\r\n";
+    async fn relay_response_no_framing_without_connection_close_is_close_delimited() {
+        let head =
+            b"HTTP/1.1 200 OK\r\nServer: test\r\nContent-Type: application/octet-stream\r\n\r\n";
+        let first = b"\x00\x01\xffbuffered-with-head";
+        let second = b"\xfe\x00arrived-later";
 
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
         let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+        let (head_seen_tx, head_seen_rx) = tokio::sync::oneshot::channel::<()>();
 
         tokio::spawn(async move {
-            upstream_write.write_all(response).await.unwrap();
-            // Do NOT close — if relay blocks on read it will hang
+            let mut response = head.to_vec();
+            response.extend_from_slice(first);
+            upstream_write.write_all(&response).await.unwrap();
+            // Write the rest only after the client has the head, so a relay
+            // that buffers the head until EOF (or treats the body as empty)
+            // fails this test instead of passing by timing.
+            tokio::time::timeout(std::time::Duration::from_secs(2), head_seen_rx)
+                .await
+                .expect("client must see the flushed head before later body bytes")
+                .unwrap();
+            upstream_write.write_all(second).await.unwrap();
+            upstream_write.shutdown().await.unwrap();
         });
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+        let reader = tokio::spawn(async move {
+            let mut received = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut signalled = Some(head_seen_tx);
+            loop {
+                let n = client_read.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+                if signalled.is_some() && received.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let _ = signalled.take().unwrap().send(());
+                }
+            }
+            received
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
             relay_response(
                 "GET",
                 &mut upstream_read,
@@ -9574,22 +9614,75 @@ mod tests {
             ),
         )
         .await
-        .expect("must not block when no Connection: close");
-
-        let outcome = result.expect("relay_response should succeed");
+        .expect("relay_response should not deadlock")
+        .expect("relay_response should succeed");
         assert!(
-            matches!(outcome, RelayOutcome::Reusable),
-            "keep-alive implied, connection reusable"
+            matches!(outcome, RelayOutcome::Consumed),
+            "a close-delimited body consumes the upstream connection"
         );
+        drop(client_write);
 
-        client_write.shutdown().await.unwrap();
+        let received = reader.await.unwrap();
+        let header_end = received
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response head")
+            + 4;
+        let head_str = String::from_utf8_lossy(&received[..header_end]);
+        assert!(head_str.starts_with("HTTP/1.1 200 OK\r\n"), "{head_str}");
+        assert!(
+            head_str.contains("Connection: close\r\n"),
+            "client must be told the connection closes: {head_str}"
+        );
+        assert!(
+            !head_str.to_ascii_lowercase().contains("content-length")
+                && !head_str.to_ascii_lowercase().contains("transfer-encoding"),
+            "no framing is invented: {head_str}"
+        );
+        let mut expected_body = first.to_vec();
+        expected_body.extend_from_slice(second);
+        assert_eq!(
+            &received[header_end..],
+            expected_body.as_slice(),
+            "body must be forwarded byte-for-byte"
+        );
+    }
+
+    /// A server that keeps an unframed HTTP/1.1 connection open ends the
+    /// close-delimited body at the relay's idle timeout rather than stalling
+    /// the client indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn relay_response_no_framing_without_close_ends_at_idle_timeout() {
+        let response = b"HTTP/1.1 200 OK\r\nServer: test\r\n\r\nhello";
+
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        upstream_write.write_all(response).await.unwrap();
+        // Keep `upstream_write` open: no EOF from the server.
+
+        let outcome = tokio::time::timeout(
+            RELAY_EOF_IDLE_TIMEOUT * 3,
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+                None,
+            ),
+        )
+        .await
+        .expect("idle timeout must end the body")
+        .expect("relay_response should succeed");
+        assert!(matches!(outcome, RelayOutcome::Consumed));
+        drop(upstream_write);
+        drop(client_write);
+
         let mut received = Vec::new();
         client_read.read_to_end(&mut received).await.unwrap();
         let received_str = String::from_utf8_lossy(&received);
-        assert!(
-            received_str.contains("200 OK"),
-            "headers should be forwarded"
-        );
+        assert!(received_str.contains("Connection: close"), "{received_str}");
+        assert!(received_str.ends_with("hello"), "{received_str}");
     }
 
     #[tokio::test]
