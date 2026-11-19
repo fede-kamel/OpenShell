@@ -1303,7 +1303,9 @@ where
                                 // with the empty-body hash. boto3 sends
                                 // x-amz-content-sha256 set to the SHA-256 of
                                 // "" on all requests, which routes here via
-                                // detect_payload_mode's catch-all.
+                                // detect_payload_mode's catch-all; clients that
+                                // omit the header on bodiless requests route
+                                // here through its absent-header fallback.
                             }
                             BodyLength::Chunked => {
                                 return Err(miette!(
@@ -3768,7 +3770,12 @@ impl fmt::Display for SigV4PayloadMode {
 /// - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` → **rejected** (the proxy cannot
 ///   reproduce per-chunk signatures; use `sigv4:no_body` instead)
 /// - Other `STREAMING-*` values → **rejected** (unsupported streaming mode)
-/// - Absent → `SignBody` if `Content-Length` present, else `UnsignedPayload`
+/// - Absent → `SignBody` when the request has a `Content-Length` body or no
+///   body at all (signed with the empty-body hash, which every service
+///   accepts); `UnsignedPayload` only for a chunked body, which cannot be
+///   hashed before it is forwarded. Clients other than S3's send no
+///   `x-amz-content-sha256` on GET requests, and only S3 accepts
+///   `UNSIGNED-PAYLOAD`.
 fn detect_payload_mode(headers: &str) -> Result<SigV4PayloadMode> {
     for line in headers.lines().skip(1) {
         let lower = line.to_ascii_lowercase();
@@ -3788,13 +3795,10 @@ fn detect_payload_mode(headers: &str) -> Result<SigV4PayloadMode> {
             };
         }
     }
-    Ok(
-        if matches!(parse_body_length(headers)?, BodyLength::ContentLength(_)) {
-            SigV4PayloadMode::SignBody
-        } else {
-            SigV4PayloadMode::UnsignedPayload
-        },
-    )
+    Ok(match parse_body_length(headers)? {
+        BodyLength::ContentLength(_) | BodyLength::None => SigV4PayloadMode::SignBody,
+        BodyLength::Chunked => SigV4PayloadMode::UnsignedPayload,
+    })
 }
 
 /// Parse Content-Length or Transfer-Encoding from HTTP headers.
@@ -12116,6 +12120,89 @@ mod tests {
         assert!(!forwarded.contains("openshell:resolve:env:"));
     }
 
+    /// Non-S3 AWS clients send bodiless GETs without `x-amz-content-sha256`.
+    /// Auto-detect must sign them over the empty-body hash: every service
+    /// other than S3 rejects `UNSIGNED-PAYLOAD` with `SignatureDoesNotMatch`.
+    #[tokio::test]
+    async fn relay_sigv4_auto_detect_signs_bodiless_get_with_empty_body_hash() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [
+                ("AWS_ACCESS_KEY_ID".to_string(), "AKIATESTKEY".to_string()),
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    "test-secret-key".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let host = "lambda.us-east-1.amazonaws.com";
+        let raw_header =
+            format!("GET /2015-03-31/functions/ HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes();
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/2015-03-31/functions/".to_string(),
+            query_params: HashMap::new(),
+            raw_header,
+            body_length: BodyLength::None,
+        };
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+        upstream_side
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: host.into(),
+            port: 443,
+            ..Default::default()
+        };
+        let correlation = RequestCorrelation::new(&req, &ctx);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            relay_http_request_with_response_middleware_guarded_observed(
+                &req,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                RelayRequestOptions {
+                    resolver: Some(&resolver),
+                    credential_signing: crate::l7::CredentialSigning::SigV4,
+                    signing_service: "lambda",
+                    signing_region: "us-east-1",
+                    host,
+                    port: 443,
+                    ..Default::default()
+                },
+                None,
+                None,
+                Some(&correlation),
+            ),
+        )
+        .await
+        .expect("relay must not deadlock")
+        .expect("relay should succeed");
+        drop(proxy_to_upstream);
+        let mut forwarded = String::new();
+        upstream_side.read_to_string(&mut forwarded).await.unwrap();
+        let forwarded = forwarded.to_ascii_lowercase();
+        assert!(
+            forwarded.contains(
+                "x-amz-content-sha256: \
+                 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            ),
+            "bodiless GET must carry the empty-body hash, got: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains("unsigned-payload"),
+            "non-S3 services reject UNSIGNED-PAYLOAD, got: {forwarded}"
+        );
+        assert!(
+            forwarded.contains("authorization: aws4-hmac-sha256"),
+            "{forwarded}"
+        );
+    }
+
     #[tokio::test]
     async fn relay_sigv4_signing_records_success_and_failure() {
         use crate::test_support::request_tracing::{RequestTracing, span_attribute};
@@ -12435,9 +12522,28 @@ mod tests {
         );
     }
 
+    /// Non-S3 clients send no `x-amz-content-sha256` on GET. The request has
+    /// no body, so it is signed with the empty-body hash; `UNSIGNED-PAYLOAD`
+    /// would be rejected by every service except S3.
     #[test]
-    fn detect_payload_mode_absent_without_content_length() {
-        let headers = "GET /bucket HTTP/1.1\r\nHost: s3.amazonaws.com\r\n\r\n";
+    fn detect_payload_mode_absent_without_body_signs_the_empty_hash() {
+        for headers in [
+            "GET /2015-03-31/functions/ HTTP/1.1\r\nHost: lambda.us-east-1.amazonaws.com\r\n\r\n",
+            "GET /?Action=GetCallerIdentity&Version=2011-06-15 HTTP/1.1\r\nHost: sts.us-east-1.amazonaws.com\r\n\r\n",
+            "GET /bucket HTTP/1.1\r\nHost: s3.amazonaws.com\r\n\r\n",
+            "DELETE /2015-03-31/functions/demo HTTP/1.1\r\nHost: lambda.us-east-1.amazonaws.com\r\n\r\n",
+        ] {
+            assert_eq!(
+                detect_payload_mode(headers).unwrap(),
+                SigV4PayloadMode::SignBody,
+                "{headers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_payload_mode_absent_with_chunked_body_is_unsigned_payload() {
+        let headers = "PUT /bucket/key HTTP/1.1\r\nHost: s3.amazonaws.com\r\nTransfer-Encoding: chunked\r\n\r\n";
         assert_eq!(
             detect_payload_mode(headers).unwrap(),
             SigV4PayloadMode::UnsignedPayload

@@ -134,7 +134,7 @@ In `sigv4` auto-detect mode, the proxy inspects the `x-amz-content-sha256` heade
 - Hex hash → buffer body and sign it (same as `sigv4:body`).
 - `UNSIGNED-PAYLOAD` → sign headers only (same as `sigv4:no_body`).
 - `STREAMING-UNSIGNED-PAYLOAD-TRAILER` → sign headers only, stream body through.
-- Absent → sign body if `Content-Length` is present, otherwise use unsigned payload.
+- Absent → sign the body if `Content-Length` is present, or sign the empty-body hash if the request has no body. Only a chunked body falls back to unsigned payload. GET requests from non-S3 AWS clients, which omit the header, are signed the way the service expects.
 
 <Note>
 Chunk-signed streaming modes like `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` are not supported. The proxy cannot reproduce per-chunk signatures. If your client SDK sends chunk-signed requests, use `sigv4:no_body` instead.
